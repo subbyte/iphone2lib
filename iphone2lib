@@ -22,6 +22,7 @@ dst_dir=$2
 # copy file to /tmp
 # HDD is slow; multiple read/probe on tmpfs to speedup
 tfile=$(mktemp)
+chmod 644 $tfile
 
 # init base timestamp
 # $baseTS is monotonically increasing through time
