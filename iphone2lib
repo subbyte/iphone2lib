@@ -1,0 +1,101 @@
+#!/usr/bin/sh
+
+if [ ! -x "$(command -v exiftool)" ]; then
+    echo "Requirement unmet: exiftool"
+    exit 1
+fi
+
+usage() {
+    echo "Usage: $0 dcim_src_dir dest_dir"
+    echo "  dcim_src_dir/ should contain 100APPLE/, etc."
+    echo "  100APPLE/ should contain raw images/videos"
+}
+
+if [ $# -lt 2 ] || [ ! -d $1 ] || [ ! -d $2 ]; then
+    usage
+    exit 1
+fi
+
+dcim_src_dir=$1
+dst_dir=$2
+
+# copy file to /tmp
+# HDD is slow; multiple read/probe on tmpfs to speedup
+tfile=$(mktemp)
+
+# init base timestamp
+# $baseTS is monotonically increasing through time
+# if file does not have time in EXIF, use $baseTS
+# the output files should not have year 2000
+# unless the first file does not have EXIF (unlikely)
+baseTS="2000-01-01 00:00:00"
+
+# do not split on space when read a line
+IFS=
+
+# do not use `find`, which does not keep order
+# use `while read` with `IFS=` for while space in filename
+# use process substitution to enable global variable $baseTS
+while read -r dname
+do
+    src_dir=$dcim_src_dir/$dname
+    if [ -d "$src_dir" ]; then
+        echo ">>> $src_dir"
+        while read -r fname
+        do
+            ext=$(echo ${fname##*.} | tr '[:upper:]' '[:lower:]')
+            if [ -f "$src_dir/$fname" ] && [ -n "$ext" ]; then
+                cp "$src_dir/$fname" $tfile
+                # both fields "Create Date" and "Date Created" are possible
+                currTS=$(exiftool $tfile \
+                    | grep 'Date' | grep 'Create' \
+                    | perl -ne 'print "$1\n" if /(\d{4}:\d\d:\d\d \d\d:\d\d:\d\d)/' \
+                    | head -n 1 \
+                    | sed 's/:/-/1; s/:/-/1')
+                date -d "$currTS" > /dev/null 2>&1  # for test purpose
+                if [ $? -eq 0 ] && [ -n "$currTS" ]; then
+                    baseS=$(date -d "$baseTS" +%s)
+                    currS=$(date -d "$currTS" +%s)
+                    if [ "$baseS" -le "$currS" ]; then
+                        baseTS=$currTS
+                        timeop="->"
+                    else
+                        # earlier time found
+                        timeop="<-"
+                    fi
+                else
+                    currTS=$baseTS
+                    timeop="  "
+                fi
+                # CheckSum Suffix
+                css=$(sha1sum $tfile | cut -c 1-8)
+                year=$(date -d "$currTS" +%Y)
+                month=$(date -d "$currTS" +%m)
+                dstname=$(date -d "$currTS" +%Y%m%d-%H%M%S-$css.$ext)
+                mkdir -p $dst_dir/$year/$month
+                if [ -f "$dst_dir/$year/$month/$dstname" ]; then
+                    csx=$(sha1sum $tfile | awk '{print $1}')
+                    csy=$(sha1sum $dst_dir/$year/$month/$dstname | awk '{print $1}')
+                    if [ "$csx" = "$csy" ]; then
+                        # duplicate found
+                        act="  "
+                    else
+                        act="!!"
+                        echo "SHA1 prefix collision: $src_dir/$fname " >&2
+                    fi
+                else
+                    act="@@"
+                    cp $tfile "$dst_dir"/$year/$month/$dstname
+                fi
+                echo "$act $timeop $currTS $fname"
+            else
+                echo "Unknown file: $src_dir/$fname" >&2
+            fi
+        done < <(ls -1 "$src_dir")
+        echo ""
+    else
+        echo "Invalid directory: $src_dir" >&2
+    fi
+done < <(ls -1 "$dcim_src_dir")
+
+rm -f $tfile
