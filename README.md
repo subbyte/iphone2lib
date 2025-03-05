@@ -1,11 +1,13 @@
-# Import iphone Photo/Video to a File-System-Based Library
+# Import iphone Photo/Video to Library
 
-- Import all data in iphone `DCIM` directory to a library.
+Import all data in iphone `DCIM` directory to a file-system-based library.
 
 ## Library Organization
 
 Files are renamed to `timestamp-checksum.ext`
-- Timestamp is `+%Y%m%d-%H%M%S`
+- Timestamp is extracted with `exiftool`
+- If no timestamp found, use latest timestamp from previous files
+- Timestamp format: `+%Y%m%d-%H%M%S`
 - Checksum is the first 8 chars of sha1sum of the file
 - Extension is the original file extension in lower case
 
@@ -16,6 +18,10 @@ Library structure:
         - Month
             - File
 ```
+
+## Requirements
+
+- `exiftool`
 
 ## How to use
 
