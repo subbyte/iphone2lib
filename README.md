@@ -25,8 +25,8 @@ Library structure:
 
 ## How to use
 
-1. Use `ifuse` to mount your phone
-2. Local the `DCIM` directory
+1. Mount your phone, e.g., using `ifuse`
+2. Locate `DCIM` in the mounted directory
 3. `iphone2lib DCIM_dir lib_dir >i2l.log 2>i2l.err`
 4. Track the status with `tail -f i2l.log`
 5. Check error in `i2l.err`
