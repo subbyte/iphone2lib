@@ -11,7 +11,7 @@ usage() {
     echo "  100APPLE/ should contain raw images/videos"
 }
 
-if [ $# -lt 2 ] || [ ! -d $1 ] || [ ! -d $2 ]; then
+if [ $# -lt 2 ] || [ ! -d "$1" ] || [ ! -d "$2" ]; then
     usage
     exit 1
 fi
@@ -22,7 +22,7 @@ dst_dir=$2
 # copy file to /tmp
 # HDD is slow; multiple read/probe on tmpfs to speedup
 tfile=$(mktemp)
-chmod 644 $tfile
+chmod 644 "$tfile"
 
 # init base timestamp
 # $baseTS is monotonically increasing through time
@@ -46,9 +46,9 @@ do
         do
             ext=$(echo ${fname##*.} | tr '[:upper:]' '[:lower:]')
             if [ -f "$src_dir/$fname" ] && [ -n "$ext" ]; then
-                cp "$src_dir/$fname" $tfile
+                cp "$src_dir/$fname" "$tfile"
                 # both fields "Create Date" and "Date Created" are possible
-                currTS=$(exiftool $tfile \
+                currTS=$(exiftool "$tfile" \
                     | grep 'Date' | grep 'Create' \
                     | perl -ne 'print "$1\n" if /(\d{4}:\d\d:\d\d \d\d:\d\d:\d\d)/' \
                     | head -n 1 \
@@ -69,14 +69,14 @@ do
                     timeop="  "
                 fi
                 # CheckSum Suffix
-                css=$(sha1sum $tfile | cut -c 1-8)
+                css=$(sha1sum "$tfile" | cut -c 1-8)
                 year=$(date -d "$currTS" +%Y)
                 month=$(date -d "$currTS" +%m)
                 dstname=$(date -d "$currTS" +%Y%m%d-%H%M%S-$css.$ext)
-                mkdir -p $dst_dir/$year/$month
+                mkdir -p "$dst_dir/$year/$month"
                 if [ -f "$dst_dir/$year/$month/$dstname" ]; then
-                    csx=$(sha1sum $tfile | awk '{print $1}')
-                    csy=$(sha1sum $dst_dir/$year/$month/$dstname | awk '{print $1}')
+                    csx=$(sha1sum "$tfile" | awk '{print $1}')
+                    csy=$(sha1sum "$dst_dir/$year/$month/$dstname" | awk '{print $1}')
                     if [ "$csx" = "$csy" ]; then
                         # duplicate found
                         act="  "
@@ -86,7 +86,7 @@ do
                     fi
                 else
                     act="@@"
-                    cp $tfile "$dst_dir"/$year/$month/$dstname
+                    cp "$tfile" "$dst_dir/$year/$month/$dstname"
                 fi
                 echo "$act $timeop $currTS $fname"
             else
@@ -99,4 +99,4 @@ do
     fi
 done < <(ls -1 "$dcim_src_dir")
 
-rm -f $tfile
+rm -f "$tfile"
