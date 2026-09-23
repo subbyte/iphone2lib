@@ -47,12 +47,19 @@ do
             ext=$(echo ${fname##*.} | tr '[:upper:]' '[:lower:]')
             if [ -f "$src_dir/$fname" ] && [ -n "$ext" ]; then
                 cp "$src_dir/$fname" "$tfile"
-                # both fields "Create Date" and "Date Created" are possible
-                currTS=$(exiftool "$tfile" \
-                    | grep 'Date' | grep 'Create' \
-                    | perl -ne 'print "$1\n" if /(\d{4}:\d\d:\d\d \d\d:\d\d:\d\d)/' \
-                    | head -n 1 \
-                    | sed 's/:/-/1; s/:/-/1')
+                # Select an explicit, timezone-consistent timestamp tag.
+                # Tag priority (first present wins):
+                #   CreationDate      - QuickTime (video); carries the camera's
+                #                       offset, so it is local wall-clock. The
+                #                       plain CreateDate for video is UTC and
+                #                       would mis-bucket by the UTC offset.
+                #   DateTimeOriginal  - photos: "when the shot was taken".
+                #   CreateDate        - last-resort fallback.
+                # -d normalizes all of them to the same local wall-clock format,
+                # so photos and videos land on one clock. -s3 prints value only.
+                currTS=$(exiftool -s3 -d '%Y-%m-%d %H:%M:%S' \
+                    -CreationDate -DateTimeOriginal -CreateDate "$tfile" \
+                    | head -n 1)
                 date -d "$currTS" > /dev/null 2>&1  # for test purpose
                 if [ $? -eq 0 ] && [ -n "$currTS" ]; then
                     baseS=$(date -d "$baseTS" +%s)
