@@ -1,7 +1,8 @@
 #!/usr/bin/bash
 #
 # checkfile.sh - find photo/video files whose names were mis-timestamped by the
-# old iphone2lib, and print the current name alongside the corrected name.
+# old iphone2lib, print the current name alongside the corrected name, and
+# optionally perform the rename.
 #
 # Two distinct old-script bugs produced wrong names:
 #   * Videos (#1): the old script read the QuickTime "CreateDate", which is
@@ -17,16 +18,31 @@
 #     wall-clock). CreationDate carries the camera offset for video and is
 #     simply absent on photos, so the same priority is correct for each.
 #
-# This tool recomputes the correct timestamp with that priority and compares it
-# against the timestamp encoded in the current filename. Only the timestamp and
-# Year/Month can be wrong: file content is untouched, so the checksum and
-# extension in the name still hold.
+# Three extra concerns this tool handles:
+#   * NO-TIMESTAMP FILES: the old iphone2lib gave a file with no usable EXIF the
+#     timestamp of the most recent file that DID have one ("baseTS"). Such a
+#     file therefore shares that predecessor's YYYYMMDD-HHMMSS prefix. If the
+#     predecessor is now corrected, the inheritor must FOLLOW it to the same new
+#     timestamp (keeping its own checksum+ext), or its name points at a stale
+#     time. We cannot recompute an inheritor's time from metadata (it has none),
+#     so we group files by their current prefix: a file matching its own EXIF is
+#     an ANCHOR; a file with no EXIF sharing that prefix is an INHERITOR and
+#     follows the anchor's correction. Zero/ambiguous anchors -> report, no move.
+#   * LIVE PHOTOS: an Apple Live Photo is a still + a .mov sharing a Content
+#     Identifier UUID. They have independent timestamps and so could land in
+#     different folders. We pair them by UUID and make the video FOLLOW the
+#     still's corrected timestamp, so the pair keeps one prefix / one folder.
+#   * SUPPRESSION: files already correctly named are not printed (use --verbose
+#     to list them as OK).
 #
-# It CHANGES NOTHING. For each mismatch it prints, tab-separated:
-#     <current path> <TAB> <corrected path>
-# so you can review before acting. Diagnostics go to stderr.
+# Only the timestamp and Year/Month in a name can be wrong: content is
+# untouched, so the checksum and extension in the name still hold.
 #
-# Usage: checkfile.sh lib_dir [--photos-only | --videos-only]
+# Without --apply it CHANGES NOTHING. For each file needing a rename it prints,
+# tab-separated:  <current path> <TAB> <corrected path>  on stdout. All
+# diagnostics and the summary go to stderr.
+#
+# Usage: checkfile.sh lib_dir [--photos-only | --videos-only] [--apply] [--verbose]
 #   lib_dir is the destination library root (contains Year/Month/ subdirs).
 
 if [ ! -x "$(command -v exiftool)" ]; then
@@ -36,52 +52,69 @@ fi
 
 mode="all"
 apply=0        # 0 = report only (default), 1 = actually mv files
+verbose=0      # 1 = also print files that need no rename (OK lines)
 lib_dir=""
 for arg in "$@"; do
     case "$arg" in
         --photos-only) mode="photos" ;;
         --videos-only) mode="videos" ;;
         --apply) apply=1 ;;
+        --verbose) verbose=1 ;;
         -*) echo "Unknown option: $arg" >&2; exit 1 ;;
         *) lib_dir=$arg ;;
     esac
 done
 
 if [ -z "$lib_dir" ] || [ ! -d "$lib_dir" ]; then
-    echo "Usage: $0 lib_dir [--photos-only | --videos-only] [--apply]" >&2
+    echo "Usage: $0 lib_dir [--photos-only | --videos-only] [--apply] [--verbose]" >&2
     echo "  lib_dir should contain Year/Month/ subdirs (see iphone2lib)" >&2
-    echo "  without --apply: report mismatches only (dry run, changes nothing)" >&2
-    echo "  with --apply:    move each mismatched file to its corrected path," >&2
-    echo "                   creating the Year/Month folder if needed" >&2
+    echo "  without --apply: report renames only (dry run, changes nothing)" >&2
+    echo "  with --apply:    move each file to its corrected path, creating the" >&2
+    echo "                   Year/Month folder if needed, never clobbering" >&2
+    echo "  --verbose:       also print files that are already correct (OK)" >&2
     exit 1
 fi
 
 # Classify by lower-cased extension (iphone2lib lower-cases extensions).
-# Returns: prints "video" or "photo" on stdout, or nothing if not media.
-# Add extensions here if your library contains others.
+# Prints "video" or "photo", or nothing if not media. Extend as needed.
 classify_ext() {
     case "$1" in
-        mov|mp4|m4v|avi|3gp|3g2)             echo "video" ;;
+        mov|mp4|m4v|avi|3gp|3g2)                      echo "video" ;;
         heic|heif|jpg|jpeg|png|gif|tiff|tif|dng|webp) echo "photo" ;;
         *) : ;;
     esac
+}
+
+# Compute the corrected local-wall-clock timestamp for a file using the fixed
+# tag priority. Prints "YYYY-MM-DD HH:MM:SS" or nothing if no usable date.
+probe_ts() {
+    local ts
+    ts=$(exiftool -s3 -d '%Y-%m-%d %H:%M:%S' \
+        -CreationDate -DateTimeOriginal -CreateDate "$1" 2>/dev/null | head -n 1)
+    if [ -n "$ts" ] && date -d "$ts" >/dev/null 2>&1; then
+        echo "$ts"
+    fi
 }
 
 # handle spaces in paths
 IFS='
 '
 
+# ---- Per-file arrays (indexed by a running integer id) ----
+declare -a F_PATH F_PREFIX F_CSEXT F_KIND F_TS F_UUID
+# ---- Maps built after pass 1 ----
+# anchor correction target per file id (new "YYYYMMDD-HHMMSS" prefix)
+declare -a F_NEWSTAMP
+# prefix -> space-separated list of anchor ids that carry that OLD prefix
+declare -A PREFIX_ANCHORS
+# normalized uuid -> still anchor id (for Live Photo pairing)
+declare -A UUID_STILL
+
+n=0
 nphoto=0
 nvideo=0
-nmismatch=0
-nnotime=0
-nmoved=0
-nconflict=0
-nmvfail=0
 
-# Library names are timestamp-checksum.ext (no newlines by construction), so a
-# plain find + IFS=newline read is fine and keeps the loop in the current shell
-# for the counters.
+# ============================ PASS 1: probe ============================
 for f in $(find "$lib_dir" -type f)
 do
     fname=$(basename "$f")
@@ -89,76 +122,142 @@ do
     kind=$(classify_ext "$ext")
     [ -n "$kind" ] || continue
 
-    # honor mode filter
     if [ "$mode" = "photos" ] && [ "$kind" != "photo" ]; then continue; fi
     if [ "$mode" = "videos" ] && [ "$kind" != "video" ]; then continue; fi
 
-    # Current filename encodes the OLD timestamp as YYYYMMDD-HHMMSS-<8hex>.ext.
-    # Pull the YYYYMMDD-HHMMSS prefix; skip anything not matching the pattern.
+    # Current name encodes the OLD timestamp as YYYYMMDD-HHMMSS-<8hex>.ext.
     old_stamp=$(echo "$fname" | grep -oE '^[0-9]{8}-[0-9]{6}')
     if [ -z "$old_stamp" ]; then
         echo "SKIP (unrecognized name): $f" >&2
         continue
     fi
 
-    if [ "$kind" = "photo" ]; then
-        nphoto=$((nphoto + 1))
-    else
-        nvideo=$((nvideo + 1))
-    fi
+    ts=$(probe_ts "$f")                     # empty => inheritor (no own EXIF)
+    uuid=$(exiftool -s3 -ContentIdentifier "$f" 2>/dev/null \
+           | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
-    # Recompute the CORRECT timestamp with the fixed tag priority.
-    currTS=$(exiftool -s3 -d '%Y-%m-%d %H:%M:%S' \
-        -CreationDate -DateTimeOriginal -CreateDate "$f" \
-        | head -n 1)
+    F_PATH[$n]=$f
+    F_PREFIX[$n]=$old_stamp
+    F_CSEXT[$n]=${fname#${old_stamp}-}      # "<8hex>.ext"
+    F_KIND[$n]=$kind
+    F_TS[$n]=$ts
+    F_UUID[$n]=$uuid
+    F_NEWSTAMP[$n]=""
 
-    if [ -z "$currTS" ] || ! date -d "$currTS" >/dev/null 2>&1; then
-        # No usable timestamp. The old script would have used its baseTS
-        # fallback here, which this tool cannot reconstruct, so the correct
-        # name cannot be asserted. Report for manual review.
-        echo "NOTIME ($kind, no usable timestamp, review manually): $f" >&2
-        nnotime=$((nnotime + 1))
-        continue
-    fi
+    if [ "$kind" = "photo" ]; then nphoto=$((nphoto + 1)); else nvideo=$((nvideo + 1)); fi
 
-    # Preserve the original checksum + extension from the current name; only the
-    # time portion is being corrected.
-    csext=${fname#${old_stamp}-}          # strip "YYYYMMDD-HHMMSS-"
-    new_stamp=$(date -d "$currTS" +%Y%m%d-%H%M%S)
-    year=$(date -d "$currTS" +%Y)
-    month=$(date -d "$currTS" +%m)
-    new_path="$lib_dir/$year/$month/$new_stamp-$csext"
-
-    if [ "$f" != "$new_path" ]; then
-        nmismatch=$((nmismatch + 1))
-        # tab-separated: current path <TAB> corrected path
-        printf '%s\t%s\n' "$f" "$new_path"
-
-        if [ "$apply" -eq 1 ]; then
-            if [ -e "$new_path" ]; then
-                # Refuse to clobber. The target may be a legitimately-timed
-                # duplicate already in place, or two files may correct to the
-                # same name. Either way, do not lose data - report and skip.
-                echo "CONFLICT (target exists, not moved): $f -> $new_path" >&2
-                nconflict=$((nconflict + 1))
-            else
-                mkdir -p "$lib_dir/$year/$month"
-                if mv -n "$f" "$new_path"; then
-                    nmoved=$((nmoved + 1))
-                else
-                    echo "MVFAIL (mv failed, left in place): $f -> $new_path" >&2
-                    nmvfail=$((nmvfail + 1))
-                fi
-            fi
+    if [ -n "$ts" ]; then
+        # anchor: has its own usable timestamp
+        new_stamp=$(date -d "$ts" +%Y%m%d-%H%M%S)
+        F_NEWSTAMP[$n]=$new_stamp
+        # newline-separated so it splits correctly under IFS=newline
+        PREFIX_ANCHORS[$old_stamp]="${PREFIX_ANCHORS[$old_stamp]}${n}
+"
+        # record the STILL side of a Live Photo for pairing
+        if [ -n "$uuid" ] && [ "$kind" = "photo" ]; then
+            UUID_STILL[$uuid]=$n
         fi
     fi
+    n=$((n + 1))
+done
+
+# =================== PASS 2: resolve targets & act ===================
+nrename=0
+nok=0
+nnotime=0
+nambig=0
+nmoved=0
+nconflict=0
+nmvfail=0
+
+emit() {
+    # $1 current path, $2 corrected path, $3 reason-tag for stderr
+    printf '%s\t%s\n' "$1" "$2"
+}
+
+do_move() {
+    # $1 current path, $2 corrected path, $3 "YYYY/MM" dest subdir
+    if [ -e "$2" ]; then
+        echo "CONFLICT (target exists, not moved): $1 -> $2" >&2
+        nconflict=$((nconflict + 1))
+        return
+    fi
+    mkdir -p "$lib_dir/$3"
+    if mv -n "$1" "$2"; then
+        nmoved=$((nmoved + 1))
+    else
+        echo "MVFAIL (mv failed, left in place): $1 -> $2" >&2
+        nmvfail=$((nmvfail + 1))
+    fi
+}
+
+i=0
+while [ "$i" -lt "$n" ]; do
+    f=${F_PATH[$i]}
+    prefix=${F_PREFIX[$i]}
+    csext=${F_CSEXT[$i]}
+    kind=${F_KIND[$i]}
+    ts=${F_TS[$i]}
+    uuid=${F_UUID[$i]}
+    new_stamp=${F_NEWSTAMP[$i]}
+
+    if [ -z "$ts" ]; then
+        # ---- INHERITOR: no own EXIF; follow its prefix group's anchor ----
+        # PREFIX_ANCHORS[prefix] is a newline-separated list of anchor ids that
+        # carry this OLD prefix. Collect the distinct corrected stamps among
+        # them; IFS=newline makes the for-loop split correctly.
+        anchors=${PREFIX_ANCHORS[$prefix]}
+        distinct=""
+        ndistinct=0
+        for a in $anchors; do
+            [ -n "$a" ] || continue
+            s=${F_NEWSTAMP[$a]}
+            case "${distinct}" in
+                *"${s}"$'\n'*) : ;;                 # already seen
+                *) distinct="${distinct}${s}"$'\n'; ndistinct=$((ndistinct + 1)) ;;
+            esac
+        done
+        if [ "$ndistinct" -eq 0 ]; then
+            echo "NOTIME ($kind, no own timestamp and no anchor to follow): $f" >&2
+            nnotime=$((nnotime + 1))
+            i=$((i + 1)); continue
+        elif [ "$ndistinct" -gt 1 ]; then
+            echo "AMBIG ($kind, prefix $prefix inherited from >1 corrected time): $f" >&2
+            nambig=$((nambig + 1))
+            i=$((i + 1)); continue
+        fi
+        new_stamp=${distinct%$'\n'}                  # the single stamp
+    elif [ -n "$uuid" ] && [ "$kind" = "video" ] && [ -n "${UUID_STILL[$uuid]}" ]; then
+        # ---- LIVE PHOTO video: follow the paired still's corrected stamp ----
+        still=${UUID_STILL[$uuid]}
+        new_stamp=${F_NEWSTAMP[$still]}
+    fi
+
+    # build corrected path from new_stamp (YYYYMMDD-HHMMSS) + original csext
+    y=${new_stamp:0:4}
+    mo=${new_stamp:4:2}
+    new_path="$lib_dir/$y/$mo/$new_stamp-$csext"
+
+    if [ "$f" = "$new_path" ]; then
+        # ---- already correct: suppress unless --verbose ----
+        nok=$((nok + 1))
+        [ "$verbose" -eq 1 ] && echo "OK: $f" >&2
+        i=$((i + 1)); continue
+    fi
+
+    nrename=$((nrename + 1))
+    emit "$f" "$new_path"
+    [ "$apply" -eq 1 ] && do_move "$f" "$new_path" "$y/$mo"
+    i=$((i + 1))
 done
 
 echo "" >&2
 echo "checked photos : $nphoto" >&2
 echo "checked videos : $nvideo" >&2
-echo "mismatches     : $nmismatch" >&2
-echo "no-timestamp   : $nnotime (reported above, need manual review)" >&2
+echo "need rename    : $nrename" >&2
+echo "already OK     : $nok (suppressed; use --verbose to list)" >&2
+echo "no-timestamp   : $nnotime (no anchor to follow, review manually)" >&2
+echo "ambiguous      : $nambig (inherited prefix maps to >1 time, review)" >&2
 if [ "$apply" -eq 1 ]; then
     echo "moved          : $nmoved" >&2
     echo "conflicts      : $nconflict (target existed, left in place)" >&2

@@ -1,4 +1,4 @@
-#!/usr/bin/sh
+#!/usr/bin/bash
 
 if [ ! -x "$(command -v exiftool)" ]; then
     echo "Requirement unmet: exiftool"
@@ -30,6 +30,19 @@ chmod 644 "$tfile"
 # the output files should not have year 2000
 # unless the first file does not have EXIF (unlikely)
 baseTS="2000-01-01 00:00:00"
+
+# Live Photo pairing memory.
+# An Apple Live Photo is a still (.HEIC/.JPG) plus a .MOV that share a Content
+# Identifier UUID. The still carries the true capture time; the video's own
+# time can differ (and be mis-bucketed). To keep a pair together under one
+# timestamp/folder, we remember each still's UUID -> timestamp as we stream,
+# and when a video with a known UUID appears we reuse the still's timestamp.
+# POSIX sh has no associative arrays, so we use a tmp file of "uuid<TAB>ts".
+# Apple names the pair with the same basename in the same folder and ls lists
+# the still (.HEIC) just before the video (.MOV), so the still is normally seen
+# first. If a video is seen before its still, it simply uses its own time.
+lpfile=$(mktemp)
+chmod 644 "$lpfile"
 
 # do not split on space when read a line
 IFS=
@@ -75,6 +88,34 @@ do
                     currTS=$baseTS
                     timeop="  "
                 fi
+
+                # Live Photo pairing by Content Identifier UUID.
+                uuid=$(exiftool -s3 -ContentIdentifier "$tfile" 2>/dev/null \
+                    | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                if [ -n "$uuid" ]; then
+                    case "$ext" in
+                        mov|mp4|m4v)
+                            # video: if we have already seen the paired still,
+                            # reuse the still's timestamp so the pair shares a
+                            # name/folder. baseTS bookkeeping above is left as
+                            # computed from the video's own reading.
+                            stillTS=$(grep -F "$uuid	" "$lpfile" \
+                                | head -n 1 | cut -f 2-)
+                            if [ -n "$stillTS" ]; then
+                                currTS=$stillTS
+                                timeop="LP"
+                            fi
+                            ;;
+                        *)
+                            # still: record its timestamp for a later video.
+                            # (one line per uuid; first still wins)
+                            if ! grep -qF "$uuid	" "$lpfile"; then
+                                printf '%s\t%s\n' "$uuid" "$currTS" >> "$lpfile"
+                            fi
+                            ;;
+                    esac
+                fi
+
                 # CheckSum Suffix
                 css=$(sha1sum "$tfile" | cut -c 1-8)
                 year=$(date -d "$currTS" +%Y)
@@ -106,4 +147,4 @@ do
     fi
 done < <(ls -1 "$dcim_src_dir")
 
-rm -f "$tfile"
+rm -f "$tfile" "$lpfile"
