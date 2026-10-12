@@ -75,6 +75,13 @@ if [ -z "$lib_dir" ] || [ ! -d "$lib_dir" ]; then
     exit 1
 fi
 
+# Normalize: strip trailing slash(es) so paths built as "$lib_dir/$y/$mo/..."
+# match find's output. Otherwise "lib/" makes new_path "lib//.." != "lib/.."
+# and every file is wrongly flagged as needing a rename. Keep a lone "/" as "/".
+while [ "${lib_dir}" != "/" ] && [ "${lib_dir%/}" != "$lib_dir" ]; do
+    lib_dir=${lib_dir%/}
+done
+
 # Classify by lower-cased extension (iphone2lib lower-cases extensions).
 # Prints "video" or "photo", or nothing if not media. Extend as needed.
 classify_ext() {
