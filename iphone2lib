@@ -1,102 +1,557 @@
-#!/usr/bin/sh
-
-if [ ! -x "$(command -v exiftool)" ]; then
-    echo "Requirement unmet: exiftool"
-    exit 1
-fi
+#!/bin/sh
 
 usage() {
-    echo "Usage: $0 dcim_src_dir dest_dir"
-    echo "  dcim_src_dir/ should contain 100APPLE/, etc."
-    echo "  100APPLE/ should contain raw images/videos"
+    printf 'Usage: %s dcim_src_dir dest_dir\n' "$0"
+    printf '%s\n' '  dcim_src_dir/ should contain 100APPLE/, etc.'
+    printf '%s\n' '  100APPLE/ should contain raw images/videos'
 }
 
-if [ $# -lt 2 ] || [ ! -d "$1" ] || [ ! -d "$2" ]; then
-    usage
-    exit 1
-fi
+check_requirements() {
+    for cmd in exiftool date sha1sum grep find head cut tr mktemp cp mkdir sort rm wc
+    do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            printf 'Requirement unmet: %s\n' "$cmd" >&2
+            exit 1
+        fi
+    done
 
-dcim_src_dir=$1
-dst_dir=$2
-
-# copy file to /tmp
-# HDD is slow; multiple read/probe on tmpfs to speedup
-tfile=$(mktemp)
-chmod 644 "$tfile"
-
-# init base timestamp
-# $baseTS is monotonically increasing through time
-# if file does not have time in EXIF, use $baseTS
-# the output files should not have year 2000
-# unless the first file does not have EXIF (unlikely)
-baseTS="2000-01-01 00:00:00"
-
-# do not split on space when read a line
-IFS=
-
-# do not use `find`, which does not keep order
-# use `while read` with `IFS=` for while space in filename
-# use process substitution to enable global variable $baseTS
-while read -r dname
-do
-    src_dir=$dcim_src_dir/$dname
-    if [ -d "$src_dir" ]; then
-        echo ">>> $src_dir"
-        while read -r fname
-        do
-            ext=$(echo ${fname##*.} | tr '[:upper:]' '[:lower:]')
-            if [ -f "$src_dir/$fname" ] && [ -n "$ext" ]; then
-                cp "$src_dir/$fname" "$tfile"
-                # both fields "Create Date" and "Date Created" are possible
-                currTS=$(exiftool "$tfile" \
-                    | grep 'Date' | grep 'Create' \
-                    | perl -ne 'print "$1\n" if /(\d{4}:\d\d:\d\d \d\d:\d\d:\d\d)/' \
-                    | head -n 1 \
-                    | sed 's/:/-/1; s/:/-/1')
-                date -d "$currTS" > /dev/null 2>&1  # for test purpose
-                if [ $? -eq 0 ] && [ -n "$currTS" ]; then
-                    baseS=$(date -d "$baseTS" +%s)
-                    currS=$(date -d "$currTS" +%s)
-                    if [ "$baseS" -le "$currS" ]; then
-                        baseTS=$currTS
-                        timeop="->"
-                    else
-                        # earlier time found
-                        timeop="<-"
-                    fi
-                else
-                    currTS=$baseTS
-                    timeop="  "
-                fi
-                # CheckSum Suffix
-                css=$(sha1sum "$tfile" | cut -c 1-8)
-                year=$(date -d "$currTS" +%Y)
-                month=$(date -d "$currTS" +%m)
-                dstname=$(date -d "$currTS" +%Y%m%d-%H%M%S-$css.$ext)
-                mkdir -p "$dst_dir/$year/$month"
-                if [ -f "$dst_dir/$year/$month/$dstname" ]; then
-                    csx=$(sha1sum "$tfile" | awk '{print $1}')
-                    csy=$(sha1sum "$dst_dir/$year/$month/$dstname" | awk '{print $1}')
-                    if [ "$csx" = "$csy" ]; then
-                        # duplicate found
-                        act="  "
-                    else
-                        act="!!"
-                        echo "SHA1 prefix collision: $src_dir/$fname " >&2
-                    fi
-                else
-                    act="@@"
-                    cp "$tfile" "$dst_dir/$year/$month/$dstname"
-                fi
-                echo "$act $timeop $currTS $fname"
-            else
-                echo "Unknown file: $src_dir/$fname" >&2
-            fi
-        done < <(ls -1 "$src_dir")
-        echo ""
-    else
-        echo "Invalid directory: $src_dir" >&2
+    if ! date -d '2000-01-01 00:00:00' '+%Y%m%d-%H%M%S' >/dev/null 2>&1; then
+        printf 'Requirement unmet: GNU-compatible date with -d support\n' >&2
+        exit 1
     fi
-done < <(ls -1 "$dcim_src_dir")
+    if ! find . -mindepth 1 -maxdepth 0 -printf '%f\n' >/dev/null 2>&1; then
+        printf 'Requirement unmet: GNU-compatible find with -printf support\n' >&2
+        exit 1
+    fi
+}
 
-rm -f "$tfile"
+cleanup() {
+    [ -n "${tmpdir:-}" ] && rm -rf -- "$tmpdir"
+}
+
+init_temp_state() {
+    tmpdir=$(mktemp -d) || {
+        printf 'Unable to create a temporary directory\n' >&2
+        exit 1
+    }
+    trap cleanup 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # Staging on tmpfs avoids repeated reads from the source device. The private
+    # mktemp directory protects state without changing permissions of imports.
+    tfile=$tmpdir/staged-media
+    lpfile=$tmpdir/live-photo-index
+    dlist=$tmpdir/directories
+    flist=$tmpdir/files
+    rawlist=$tmpdir/unsorted-list
+    candfile=$tmpdir/candidates
+    idx=$tmpdir/library-index
+    scanfile=$tmpdir/metadata-scan
+
+    if ! { : > "$tfile" && : > "$lpfile" && : > "$dlist" &&
+           : > "$flist" && : > "$rawlist" && : > "$candfile" &&
+           : > "$idx" && : > "$scanfile"; }; then
+        printf 'Unable to create temporary state files\n' >&2
+        exit 1
+    fi
+}
+
+init_colours() {
+    if [ -t 1 ]; then
+        red=$(printf '\033[31m')
+        rst=$(printf '\033[0m')
+    else
+        red=
+        rst=
+    fi
+}
+
+print_legend() {
+    [ -t 1 ] || return
+    printf '%s\n' \
+        'Legend: <action> <time> YYYY-MM-DD HH:MM:SS filename' \
+        '  action: @@ copied' \
+        '             (blank) already present at this name' \
+        '          =~ duplicate without own time' \
+        '          =! unexpected duplicate' \
+        '          !! checksum-prefix collision' \
+        '  time:   -> own time advanced latest' \
+        '          <- own time was earlier' \
+        '             (blank) reused latest' \
+        '          && reused Live Photo still time' \
+        '  =! and !! are red on a terminal' \
+        ''
+}
+
+# Write a deterministic, one-level directory listing. The caller redirects the
+# resulting file into a loop so shell state is not lost in a pipeline subshell.
+list_names() {
+    dir=$1
+    output=$2
+    find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' > "$rawlist" &&
+        sort "$rawlist" > "$output"
+}
+
+# Existing canonical names provide an 8-hex candidate index. Full hashes are
+# calculated only for candidates, so short-hash collisions remain safe.
+build_library_index() {
+    if ! find "$dst_dir" -type f > "$rawlist"; then
+        printf 'Unable to index destination library: %s\n' "$dst_dir" >&2
+        exit 1
+    fi
+
+    index_failed=0
+    while IFS= read -r path
+    do
+        name=${path##*/}
+        case "$name" in
+            *.*)
+                stem=${name%.*}
+                short_hash=${stem##*-}
+                if [ "${#short_hash}" -eq 8 ] &&
+                   printf '%s\n' "$short_hash" | grep -Eq '^[0-9a-f]{8}$'; then
+                    if ! printf '%s\t%s\n' "$short_hash" "$path" >> "$idx"; then
+                        index_failed=1
+                        break
+                    fi
+                fi
+                ;;
+        esac
+    done < "$rawlist"
+
+    if [ "$index_failed" -ne 0 ]; then
+        printf 'Unable to write temporary library index\n' >&2
+        exit 1
+    fi
+}
+
+hash_file() {
+    hash_output=$(sha1sum "$1") || return 1
+    hash_value=${hash_output%% *}
+    printf '%s\n' "$hash_value" | grep -Eq '^[0-9a-f]{40}$' || return 1
+    printf '%s\n' "$hash_value"
+}
+
+build_candidates() {
+    wanted_hash=$1
+    : > "$candfile" || return 1
+    while IFS= read -r record
+    do
+        record_hash=${record%%"$tab"*}
+        [ "$record_hash" = "$wanted_hash" ] || continue
+        record_path=${record#*"$tab"}
+        printf '%s\n' "$record_path" >> "$candfile" || return 1
+    done < "$idx"
+}
+
+find_duplicate() {
+    short_hash=$1
+    full_hash=$2
+    wanted_path=$3
+    found=
+
+    if ! build_candidates "$short_hash"; then
+        printf 'Unable to read library index or write candidate list\n' >&2
+        exit 1
+    fi
+
+    while IFS= read -r candidate
+    do
+        [ -n "$candidate" ] || continue
+        [ -f "$candidate" ] || continue
+        if ! candidate_hash=$(hash_file "$candidate"); then
+            printf 'Failed to hash library file, ignoring index entry: %s\n' \
+                "$candidate" >&2
+            continue
+        fi
+        if [ "$candidate_hash" = "$full_hash" ]; then
+            found=$candidate
+            [ "$candidate" = "$wanted_path" ] && break
+        fi
+    done < "$candfile"
+}
+
+probe_metadata() {
+    source_path=$1
+
+    # ExifTool emits explicitly requested tags in command-line order, giving
+    # video CreationDate priority over photo capture and fallback dates. -T
+    # keeps all three on one tab-separated line ('-' for an absent tag), so the
+    # selection below mirrors index_live_photo_dir exactly: the first tag that
+    # is both present AND date-parseable wins. Taking the first present tag and
+    # only then validating it would diverge from pass 1 when that tag's value is
+    # unparseable (e.g. a zeroed date), splitting a Live Photo across folders.
+    if ts_output=$(exiftool -s3 -T -d '%Y-%m-%d %H:%M:%S' \
+        -CreationDate -DateTimeOriginal -CreateDate "$tfile" 2>/dev/null); then
+        :
+    else
+        printf 'Warning: ExifTool timestamp probe failed for: %s\n' \
+            "$source_path" >&2
+    fi
+    ts_line=$(printf '%s\n' "$ts_output" | head -n 1)
+    probe_cre=${ts_line%%"$tab"*}
+    probe_rest=${ts_line#*"$tab"}
+    probe_dto=${probe_rest%%"$tab"*}
+    probe_crd=${probe_rest#*"$tab"}
+
+    currTS=
+    for cand in "$probe_cre" "$probe_dto" "$probe_crd"
+    do
+        if [ "$cand" != '-' ] && [ -n "$cand" ] &&
+           date -d "$cand" >/dev/null 2>&1; then
+            currTS=$cand
+            break
+        fi
+    done
+
+    if [ -n "$currTS" ]; then
+        has_own_time=1
+        timeop='->'   # init; resolve_timestamp may overwrite
+    else
+        has_own_time=0
+        currTS=$baseTS
+        timeop='  '   # init
+    fi
+
+    if uuid_output=$(exiftool -s3 -ContentIdentifier "$tfile" 2>/dev/null); then
+        :
+    else
+        printf 'Warning: ExifTool ContentIdentifier probe failed for: %s\n' \
+            "$source_path" >&2
+    fi
+    uuid=$(printf '%s\n' "$uuid_output" | head -n 1 |
+        tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+}
+
+lookup_live_photo_time() {
+    wanted_uuid=$1
+    stillTS=
+    while IFS= read -r record
+    do
+        record_uuid=${record%%"$tab"*}
+        if [ "$record_uuid" = "$wanted_uuid" ]; then
+            stillTS=${record#*"$tab"}
+            break
+        fi
+    done < "$lpfile"
+}
+
+resolve_timestamp() {
+    ext=$1
+    paired_time=0
+
+    # A Live Photo video adopts its still's time. The index is fully built in
+    # pass 1, so this read succeeds whether or not the still was imported yet.
+    case "$ext" in
+        mov|mp4|m4v)
+            if [ -n "$uuid" ]; then
+                lookup_live_photo_time "$uuid"
+                if [ -n "$stillTS" ]; then
+                    currTS=$stillTS
+                    paired_time=1
+                    timeop='&&'
+                fi
+            fi
+            ;;
+    esac
+
+    # baseTS follows the effective timestamp, including Live Photo pairing.
+    if [ "$has_own_time" -eq 1 ] || [ "$paired_time" -eq 1 ]; then
+        baseS=$(date -d "$baseTS" +%s)
+        currS=$(date -d "$currTS" +%s)
+        if [ "$baseS" -le "$currS" ]; then
+            baseTS=$currTS
+            [ "$paired_time" -eq 1 ] || timeop='->'
+        else
+            [ "$paired_time" -eq 1 ] || timeop='<-'
+        fi
+    fi
+}
+
+make_destination() {
+    source_path=$1
+    ext=$2
+
+    if ! sha1=$(hash_file "$tfile"); then
+        printf 'Failed to hash staged source file: %s\n' "$source_path" >&2
+        return 1
+    fi
+    hex=$(printf '%s\n' "$sha1" | cut -c 1-8)
+    if ! stamp=$(date -d "$currTS" '+%Y%m%d-%H%M%S'); then
+        printf 'Failed to format timestamp for: %s\n' "$source_path" >&2
+        return 1
+    fi
+
+    year=${stamp%%????-??????}
+    stamp_tail=${stamp#????}
+    month=${stamp_tail%%??-??????}
+    dstname=$stamp-$hex.$ext
+    want=$dst_dir/$year/$month/$dstname
+
+    if ! mkdir -p "$dst_dir/$year/$month"; then
+        printf 'Failed to create destination directory: %s\n' \
+            "$dst_dir/$year/$month" >&2
+        return 1
+    fi
+}
+
+import_or_classify() {
+    source_path=$1
+
+    alert=
+    if [ -n "$found" ]; then
+        if [ "$found" = "$want" ]; then
+            act='  '
+        elif [ "$has_own_time" -eq 0 ]; then
+            act='=~'
+            printf 'Duplicate content, kept existing: %s =~ %s\n' \
+                "$source_path" "$found" >&2
+        else
+            act='=!'
+            alert=1
+            printf 'Duplicate content with its OWN timestamp (%s) at a different path: %s =! %s\n' \
+                "$currTS" "$source_path" "$found" >&2
+        fi
+    elif [ -f "$want" ]; then
+        if ! existing_hash=$(hash_file "$want"); then
+            printf 'Failed to hash existing destination file: %s\n' "$want" >&2
+            return 1
+        elif [ "$existing_hash" = "$sha1" ]; then
+            act='  '
+        else
+            act='!!'
+            alert=1
+            printf 'SHA1 prefix collision: %s\n' "$source_path" >&2
+        fi
+    else
+        act='@@'
+        if ! cp "$tfile" "$want"; then
+            printf 'Failed to copy file to destination: %s\n' "$want" >&2
+            return 1
+        fi
+        if ! printf '%s\t%s\n' "$hex" "$want" >> "$idx"; then
+            printf 'Unable to update temporary library index after importing: %s\n' \
+                "$want" >&2
+            exit 1
+        fi
+    fi
+}
+
+log_result() {
+    fname=$1
+    if [ -n "$alert" ]; then
+        printf '%s%s %s %s %s%s\n' \
+            "$red" "$act" "$timeop" "$currTS" "$fname" "$rst"
+    else
+        printf '%s %s %s %s\n' "$act" "$timeop" "$currTS" "$fname"
+    fi
+}
+
+process_file() {
+    src_dir=$1
+    fname=$2
+    source_path=$src_dir/$fname
+
+    if [ -L "$source_path" ]; then
+        printf 'Symlink rejected: %s\n' "$source_path" >&2
+        return
+    fi
+
+    case "$fname" in
+        ?*.*)
+            ext=${fname##*.}
+            [ -n "$ext" ] &&
+                ext=$(printf '%s\n' "$ext" | tr '[:upper:]' '[:lower:]')
+            ;;
+        *) ext= ;;
+    esac
+    if [ ! -f "$source_path" ] || [ -z "$ext" ]; then
+        printf 'Unknown or extensionless file: %s\n' "$source_path" >&2
+        return
+    fi
+
+    # Supported media.
+    case "$ext" in
+        heic|heif|jpg|jpeg|dng|png|gif|tif|tiff|mov|mp4|m4v) ;;
+        *)
+            printf 'Unsupported media extension, not imported: %s\n' \
+                "$source_path" >&2
+            return
+            ;;
+    esac
+
+    if ! cp "$source_path" "$tfile"; then
+        printf 'Failed to stage source file: %s\n' "$source_path" >&2
+        return
+    fi
+
+    probe_metadata "$source_path"
+    resolve_timestamp "$ext"
+    make_destination "$source_path" "$ext" || return
+    find_duplicate "$hex" "$sha1" "$want"
+    import_or_classify "$source_path" || return
+    log_result "$fname"
+}
+
+process_directory() {
+    src_dir=$1
+
+    if [ -L "$src_dir" ]; then
+        printf 'Symlinked source directory rejected: %s\n' "$src_dir" >&2
+        return
+    fi
+    if [ ! -d "$src_dir" ]; then
+        printf 'Invalid directory: %s\n' "$src_dir" >&2
+        return
+    fi
+
+    printf '>>> %s\n' "$src_dir"
+    if ! list_names "$src_dir" "$flist"; then
+        printf 'Unable to list source directory: %s\n' "$src_dir" >&2
+        return
+    fi
+    while IFS= read -r fname
+    do
+        entry=$src_dir/$fname
+        # iOS keeps media flat inside each NNNAPPLE folder, so a subdirectory
+        # here is non-standard. We don't recurse, but we warn: a silent skip
+        # would hide real photos in a backup or reorganized copy.
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            nested_count=$(find "$entry" -type f 2>/dev/null | wc -l)
+            printf 'Skipped nested subdirectory, its %s file(s) not imported: %s\n' \
+                "$nested_count" "$entry" >&2
+            continue
+        fi
+        process_file "$src_dir" "$fname"
+    done < "$flist"
+    printf '\n'
+}
+
+# Pass 1 indexes every still's UUID -> timestamp before pass 2 imports anything,
+# so a Live Photo video pairs with its still no matter which is seen first. This
+# only reads metadata headers, so the source bytes are still read once total (the
+# pass-2 staging copy); a two-pass flow does not mean a second expensive read.
+index_live_photo_dir() {
+    scan_dir=$1
+
+    [ -L "$scan_dir" ] && return
+    [ -d "$scan_dir" ] || return
+
+    # Tag list and -d format match probe_metadata, so a still's indexed time is
+    # exactly what pass 2 would compute for it. Non-recursive, like the import.
+    if ! exiftool -q -s3 -T -d '%Y-%m-%d %H:%M:%S' \
+        -FileName -ContentIdentifier \
+        -CreationDate -DateTimeOriginal -CreateDate \
+        "$scan_dir" > "$scanfile" 2>/dev/null; then
+        printf 'Warning: metadata pre-scan failed for directory: %s\n' \
+            "$scan_dir" >&2
+        return
+    fi
+
+    while IFS="$tab" read -r scan_name scan_uuid scan_cre scan_dto scan_crd
+    do
+        # ExifTool prints '-' for an absent tag under -T.
+        if [ "$scan_uuid" = '-' ] || [ -z "$scan_uuid" ]; then
+            continue
+        fi
+
+        case "$scan_name" in
+            *.*) scan_ext=${scan_name##*.} ;;
+            *)   continue ;;
+        esac
+        scan_ext=$(printf '%s\n' "$scan_ext" | tr '[:upper:]' '[:lower:]')
+        case "$scan_ext" in
+            mov|mp4|m4v) continue ;;  # videos are the lookup side, not stills
+            heic|heif|jpg|jpeg|dng|png|gif|tif|tiff) ;;
+            *) continue ;;
+        esac
+
+        # First present, parseable tag wins, mirroring probe_metadata's order.
+        scan_ts=
+        for cand in "$scan_cre" "$scan_dto" "$scan_crd"
+        do
+            if [ "$cand" != '-' ] && [ -n "$cand" ] &&
+               date -d "$cand" >/dev/null 2>&1; then
+                scan_ts=$cand
+                break
+            fi
+        done
+        [ -n "$scan_ts" ] || continue
+
+        scan_uuid=$(printf '%s\n' "$scan_uuid" |
+            tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        [ -n "$scan_uuid" ] || continue
+
+        # One still per UUID is enough for pairing; first seen wins.
+        lookup_live_photo_time "$scan_uuid"
+        [ -n "$stillTS" ] && continue
+
+        if ! printf '%s\t%s\n' "$scan_uuid" "$scan_ts" >> "$lpfile"; then
+            printf 'Unable to update temporary Live Photo index\n' >&2
+            exit 1
+        fi
+    done < "$scanfile"
+}
+
+index_live_photos() {
+    while IFS= read -r dname
+    do
+        index_live_photo_dir "$dcim_src_dir/$dname"
+    done < "$dlist"
+}
+
+main() {
+    check_requirements
+    # Accept an optional "--" so a directory whose name starts with "-" can be
+    # passed unambiguously; the two positional args themselves are unchanged.
+    if [ "${1:-}" = '--' ]; then
+        shift
+    fi
+    if [ "$#" -ne 2 ] || [ ! -d "$1" ] || [ ! -d "$2" ]; then
+        usage
+        exit 1
+    fi
+
+    # Absolute paths prevent find from parsing leading-dash names as options.
+    if ! dcim_src_dir=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd -P); then
+        printf 'Unable to resolve source directory: %s\n' "$1" >&2
+        exit 1
+    fi
+    if ! dst_dir=$(CDPATH='' cd -P -- "$2" 2>/dev/null && pwd -P); then
+        printf 'Unable to resolve destination directory: %s\n' "$2" >&2
+        exit 1
+    fi
+    tab=$(printf '\t')
+    baseTS='2000-01-01 00:00:00'
+
+    init_temp_state
+    init_colours
+    build_library_index
+
+    if ! list_names "$dcim_src_dir" "$dlist"; then
+        printf 'Unable to list source directory: %s\n' "$dcim_src_dir" >&2
+        exit 1
+    fi
+
+    index_live_photos          # pass 1: build the Live Photo index
+
+    print_legend
+
+    # pass 2: stage, hash, time-resolve and import each file
+    while IFS= read -r dname
+    do
+        entry=$dcim_src_dir/$dname
+        # Expected layout is DCIM/NNNAPPLE/file; a file loose in the root (seen
+        # with MTP mounts) sits a level too high. Warn, don't silently skip.
+        if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+            printf 'Skipped loose file in source root (expected NNNAPPLE/ subdirectory), not imported: %s\n' \
+                "$entry" >&2
+            continue
+        fi
+        process_directory "$entry"
+    done < "$dlist"
+}
+
+main "$@"
