@@ -1,23 +1,20 @@
-# Import iphone Photo/Video to Library
+# Import iPhone Photo/Video to Library
 
-Import all data in iphone `DCIM` directory to a file-system-based library.
+Import media from an iPhone `DCIM` directory into a file-system-based library.
 
 ## Library Organization
 
-Files are renamed to `timestamp-checksum.ext`
-- Timestamp is extracted with `exiftool`
-- If no timestamp found, use latest timestamp from previous files
-- Timestamp format: `+%Y%m%d-%H%M%S`
-- Checksum is the first 8 chars of sha1sum of the file
-- Extension is the original file extension in lower case
+Files are copied to `Year/Month/YYYYmmdd-HHMMSS-<checksum>.ext`:
+- Timestamp: first valid `CreationDate`, `DateTimeOriginal` or `CreateDate`
+  (via `exiftool`); if none, the latest timestamp seen so far
+- Live Photo videos take the timestamp of their paired still
+- Checksum: first 8 hex chars of the file's SHA-1
+- Extension: original, lowercased
 
-Library structure:
-```
-- Root
-    - Year
-        - Month
-            - File
-```
+Supported: heic heif jpg jpeg dng png gif tif tiff webp mov mp4 m4v.
+Duplicates (same full SHA-1) are not copied again, so re-running is safe.
+Other files, symlinks, nested subdirectories and loose files in `DCIM/`
+are skipped with a warning.
 
 ## Requirements
 
@@ -29,4 +26,4 @@ Library structure:
 2. Locate `DCIM` in the mounted directory
 3. `iphone2lib DCIM_dir lib_dir >i2l.log 2>i2l.err`
 4. Track the status with `tail -f i2l.log`
-5. Check error in `i2l.err`
+5. Check warnings in `i2l.err`

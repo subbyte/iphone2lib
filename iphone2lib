@@ -374,7 +374,7 @@ process_file() {
 
     # Supported media.
     case "$ext" in
-        heic|heif|jpg|jpeg|dng|png|gif|tif|tiff|mov|mp4|m4v) ;;
+        heic|heif|jpg|jpeg|dng|png|gif|tif|tiff|webp|mov|mp4|m4v) ;;
         *)
             printf 'Unsupported media extension, not imported: %s\n' \
                 "$source_path" >&2
@@ -464,7 +464,7 @@ index_live_photo_dir() {
         scan_ext=$(printf '%s\n' "$scan_ext" | tr '[:upper:]' '[:lower:]')
         case "$scan_ext" in
             mov|mp4|m4v) continue ;;  # videos are the lookup side, not stills
-            heic|heif|jpg|jpeg|dng|png|gif|tif|tiff) ;;
+            heic|heif|jpg|jpeg|dng|png|gif|tif|tiff|webp) ;;
             *) continue ;;
         esac
 
