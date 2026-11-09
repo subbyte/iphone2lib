@@ -5,7 +5,8 @@ Import media from an iPhone `DCIM` directory into a file-system-based library.
 ## Library Organization
 
 Files are copied to `Year/Month/YYYYmmdd-HHMMSS-<checksum>.ext`:
-- Timestamp: first valid `CreationDate`, `DateTimeOriginal` or `CreateDate`
+- Timestamp: first valid `CreationDate`, `DateTimeOriginal`, `CreateDate` or
+  `XMP-photoshop:DateCreated` (the last only when it includes a full time)
   (via `exiftool`); if none, the latest timestamp seen so far
 - Live Photo videos take the timestamp of their paired still
 - Checksum: first 8 hex chars of the file's SHA-1

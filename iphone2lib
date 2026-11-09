@@ -173,18 +173,38 @@ find_duplicate() {
     done < "$candfile"
 }
 
+# Last-resort timestamp fallback: XMP-photoshop:DateCreated (exiftool's "Date
+# Created", common on PNGs such as screenshots). $1 is the RAW value (requested
+# with '#'). XMP allows partial dates and -d formatting would turn "2017:08:25"
+# into a bogus midnight, so accept only a full "YYYY:MM:DD HH:MM:SS" and keep
+# the wall-clock time, ignoring any timezone suffix. Sets xmp_ts ('' if unusable).
+# Keep in sync with checkfile.sh.
+xmp_full_ts() {
+    xmp_ts=
+    case "$1" in
+        [0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*)
+            xmp_v=${1%"${1#???????????????????}"}   # first 19 chars
+            xmp_y=${xmp_v%%:*}
+            xmp_r=${xmp_v#*:}
+            xmp_m=${xmp_r%%:*}
+            xmp_ts=$xmp_y-$xmp_m-${xmp_r#*:}
+            ;;
+    esac
+}
+
 probe_metadata() {
     source_path=$1
 
     # ExifTool emits explicitly requested tags in command-line order, giving
     # video CreationDate priority over photo capture and fallback dates. -T
-    # keeps all three on one tab-separated line ('-' for an absent tag), so the
+    # keeps all four on one tab-separated line ('-' for an absent tag), so the
     # selection below mirrors index_live_photo_dir exactly: the first tag that
     # is both present AND date-parseable wins. Taking the first present tag and
     # only then validating it would diverge from pass 1 when that tag's value is
     # unparseable (e.g. a zeroed date), splitting a Live Photo across folders.
     if ts_output=$(exiftool -s3 -T -d '%Y-%m-%d %H:%M:%S' \
-        -CreationDate -DateTimeOriginal -CreateDate "$tfile" 2>/dev/null); then
+        -CreationDate -DateTimeOriginal -CreateDate \
+        -XMP-photoshop:DateCreated# "$tfile" 2>/dev/null); then
         :
     else
         printf 'Warning: ExifTool timestamp probe failed for: %s\n' \
@@ -194,10 +214,13 @@ probe_metadata() {
     probe_cre=${ts_line%%"$tab"*}
     probe_rest=${ts_line#*"$tab"}
     probe_dto=${probe_rest%%"$tab"*}
-    probe_crd=${probe_rest#*"$tab"}
+    probe_rest=${probe_rest#*"$tab"}
+    probe_crd=${probe_rest%%"$tab"*}
+    xmp_full_ts "${probe_rest#*"$tab"}"
+    probe_xdc=$xmp_ts
 
     currTS=
-    for cand in "$probe_cre" "$probe_dto" "$probe_crd"
+    for cand in "$probe_cre" "$probe_dto" "$probe_crd" "$probe_xdc"
     do
         if [ "$cand" != '-' ] && [ -n "$cand" ] &&
            date -d "$cand" >/dev/null 2>&1; then
@@ -444,13 +467,14 @@ index_live_photo_dir() {
     if ! exiftool -q -s3 -T -d '%Y-%m-%d %H:%M:%S' \
         -FileName -ContentIdentifier \
         -CreationDate -DateTimeOriginal -CreateDate \
+        -XMP-photoshop:DateCreated# \
         "$scan_dir" > "$scanfile" 2>/dev/null; then
         printf 'Warning: metadata pre-scan failed for directory: %s\n' \
             "$scan_dir" >&2
         return
     fi
 
-    while IFS="$tab" read -r scan_name scan_uuid scan_cre scan_dto scan_crd
+    while IFS="$tab" read -r scan_name scan_uuid scan_cre scan_dto scan_crd scan_xdc
     do
         # ExifTool prints '-' for an absent tag under -T.
         if [ "$scan_uuid" = '-' ] || [ -z "$scan_uuid" ]; then
@@ -470,7 +494,8 @@ index_live_photo_dir() {
 
         # First present, parseable tag wins, mirroring probe_metadata's order.
         scan_ts=
-        for cand in "$scan_cre" "$scan_dto" "$scan_crd"
+        xmp_full_ts "$scan_xdc"
+        for cand in "$scan_cre" "$scan_dto" "$scan_crd" "$xmp_ts"
         do
             if [ "$cand" != '-' ] && [ -n "$cand" ] &&
                date -d "$cand" >/dev/null 2>&1; then
