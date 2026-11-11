@@ -50,6 +50,6 @@ matching the canonical name are treated as library members.
 
 1. Mount your phone, e.g., using `ifuse /mnt/iphone/`
 2. Locate `DCIM` in the mounted directory
-3. `iphone2lib DCIM_dir lib_dir >i2l.log 2>i2l.err`
+3. `import DCIM_dir lib_dir >i2l.log 2>i2l.err`
 4. Track the status with `tail -f i2l.log`
 5. Check warnings in `i2l.err`
