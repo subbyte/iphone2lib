@@ -2,6 +2,28 @@
 
 Import media from an iPhone `DCIM` directory into a file-system-based library.
 
+## How It Works
+
+Two passes over the source, so a Live Photo video pairs with its still no
+matter which of the two is seen first:
+
+1. **Index Live Photos.** Read metadata headers from every still in each
+   `DCIM/NNNAPPLE/`, recording `ContentIdentifier -> timestamp`.
+2. **Import.** For each file: stage a copy to a temporary directory, read its
+   timestamp and `ContentIdentifier`, resolve the final timestamp (pass-1
+   pairing for videos), hash it, then copy it to its canonical name unless the
+   same content is already in the library.
+
+Pass 1 reads only headers, so the source bytes are read once in total: the
+staging copy in pass 2. Imports are also deduplicated against each other, so a
+file repeated inside `DCIM/` is copied once.
+
+The destination is indexed up front, by short checksum, from the canonical
+`Year/Month` names already present. A short-checksum match is only a candidate:
+the full SHA-1 is recomputed before anything is treated as a duplicate. Files
+elsewhere under the destination — a thumbnail cache, `.Trash`, a backup
+directory — are not library members and are ignored.
+
 ## Library Organization
 
 Files are copied to `Year/Month/YYYYmmdd-HHMMSS-<checksum>.ext`:
@@ -17,13 +39,16 @@ Duplicates (same full SHA-1) are not copied again, so re-running is safe.
 Other files, symlinks, nested subdirectories and loose files in `DCIM/`
 are skipped with a warning.
 
+Unrelated files may live under the library root; only `Year/Month` files
+matching the canonical name are treated as library members.
+
 ## Requirements
 
 - `exiftool`
 
 ## How to use
 
-1. Mount your phone, e.g., using `ifuse`
+1. Mount your phone, e.g., using `ifuse /mnt/iphone/`
 2. Locate `DCIM` in the mounted directory
 3. `iphone2lib DCIM_dir lib_dir >i2l.log 2>i2l.err`
 4. Track the status with `tail -f i2l.log`
