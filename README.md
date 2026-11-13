@@ -4,6 +4,17 @@ Import media from an iPhone `DCIM` directory into a file-system-based library.
 
 ## How It Works
 
+`iphone2lib` runs preparation and importing steps:
+
+#### Preparation
+
+Read the source (`DCIM` directory), index the destination (existing files in
+the library) to avoid duplicates from source. Only directories/files explained
+in the [Library Organization](#library-organization) are indexed, not
+including `.cache/`, `.Trash/`, etc.
+
+#### Importing
+
 Two passes over the source, so a Live Photo video pairs with its still no
 matter which of the two is seen first:
 
@@ -17,12 +28,6 @@ matter which of the two is seen first:
 Pass 1 reads only headers, so the source bytes are read once in total: the
 staging copy in pass 2. Imports are also deduplicated against each other, so a
 file repeated inside `DCIM/` is copied once.
-
-The destination is indexed up front, by short checksum, from the canonical
-`Year/Month` names already present. A short-checksum match is only a candidate:
-the full SHA-1 is recomputed before anything is treated as a duplicate. Files
-elsewhere under the destination — a thumbnail cache, `.Trash`, a backup
-directory — are not library members and are ignored.
 
 ## Library Organization
 
@@ -50,6 +55,6 @@ matching the canonical name are treated as library members.
 
 1. Mount your phone, e.g., using `ifuse /mnt/iphone/`
 2. Locate `DCIM` in the mounted directory
-3. `import DCIM_dir lib_dir >i2l.log 2>i2l.err`
+3. `iphone2lib DCIM_dir lib_dir >i2l.log 2>i2l.err`
 4. Track the status with `tail -f i2l.log`
 5. Check warnings in `i2l.err`
